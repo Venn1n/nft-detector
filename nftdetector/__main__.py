@@ -14,6 +14,7 @@ from .analyzer import CollectionAnalyzer
 from .detector import ScamDetector
 from .notifier import TelegramNotifier
 from .floor import FloorMonitor
+from .autodetect import AutoDetector
 
 log = logging.getLogger("nftdetector")
 
@@ -28,6 +29,7 @@ class NFTDetector:
         self.detector = ScamDetector()
         self.notifier = TelegramNotifier(config.get("telegram", {}))
         self.floor_monitor = FloorMonitor(config)
+        self.autodetect = AutoDetector(config)
         self._watched_contracts: set[str] = set(config.get("watch_contracts", []))
     
     async def start(self):
@@ -182,6 +184,29 @@ def main():
     # monitor (daemon)
     p_monitor = subparsers.add_parser("monitor", help="Start monitoring daemon")
     
+    # trending
+    p_trending = subparsers.add_parser("trending", help="Show trending collections from OpenSea")
+    p_trending.add_argument("--limit", type=int, default=20)
+    p_trending.add_argument("--json", action="store_true")
+    
+    # hot-mints
+    p_hot = subparsers.add_parser("hot-mints", help="Detect collections with high mint activity")
+    p_hot.add_argument("--min-mints", type=int, default=5)
+    p_hot.add_argument("--json", action="store_true")
+    
+    # whale
+    p_whale = subparsers.add_parser("whale", help="Detect whale purchases")
+    p_whale.add_argument("--min-value", type=float, default=5.0, help="Min ETH value")
+    p_whale.add_argument("--json", action="store_true")
+    
+    # search
+    p_search = subparsers.add_parser("search", help="Search collections by name")
+    p_search.add_argument("query", help="Search query")
+    p_search.add_argument("--json", action="store_true")
+    
+    # auto
+    p_auto = subparsers.add_parser("auto", help="Auto-detect trending mints & whales (daemon)")
+    
     # Global
     parser.add_argument("--config", "-c", default="config.yaml")
     parser.add_argument("--verbose", "-v", action="store_true")
@@ -230,6 +255,74 @@ def main():
         
         elif args.command == "monitor":
             await detector.start()
+        
+        elif args.command == "trending":
+            trending = await detector.autodetect.scan_trending(limit=args.limit)
+            if args.json:
+                print(json.dumps(trending, indent=2))
+            else:
+                print(f"\n🔥 Trending Collections (Top {len(trending)}):\n")
+                for i, c in enumerate(trending[:args.limit], 1):
+                    floor = f"{c['floor_price']:.3f}" if c['floor_price'] else "—"
+                    vol = f"{c['one_day_volume']:.2f}" if c['one_day_volume'] else "0"
+                    print(f"  {i:2}. {c['name']:<30} Floor: {floor} ETH | 24h Vol: {vol} ETH")
+        
+        elif args.command == "hot-mints":
+            hot = await detector.autodetect.scan_hot_mints()
+            filtered = [h for h in hot if h["mint_count"] >= args.min_mints]
+            if args.json:
+                print(json.dumps(filtered, indent=2))
+            else:
+                print(f"\n🔥 Hot Mints ({len(filtered)} collections):\n")
+                for h in filtered[:10]:
+                    print(f"  ⚡ {h['name']:<30} {h['mint_count']} mints")
+                    for m in h['recent_mints'][:3]:
+                        print(f"      └─ #{m['token_id']} → {m['to'][:10]}...")
+        
+        elif args.command == "whale":
+            whales = await detector.autodetect.scan_whale_activity(min_value=args.min_value)
+            if args.json:
+                print(json.dumps(whales, indent=2))
+            else:
+                print(f"\n🐋 Whale Purchases (≥{args.min_value} ETH):\n")
+                for w in whales[:10]:
+                    print(f"  💰 {w['collection']:<25} #{w['token_id']}")
+                    print(f"      {w['price']:.2f} {w['symbol']} | {w['buyer'][:10]}...")
+        
+        elif args.command == "search":
+            results = await detector.autodetect.search_collections(args.query)
+            if args.json:
+                print(json.dumps(results, indent=2))
+            else:
+                print(f"\n🔍 Search: '{args.query}' ({len(results)} results):\n")
+                for r in results[:10]:
+                    floor = f"{r['floor_price']:.3f}" if r['floor_price'] else "—"
+                    print(f"  • {r['name']:<30} Floor: {floor} ETH | Supply: {r['total_supply']}")
+                    print(f"    {r['contract']}")
+        
+        elif args.command == "auto":
+            async def on_alert(event_type, data):
+                if event_type == "hot_mint":
+                    print(f"\n🔥 HOT MINT: {data['name']} ({data['mint_count']} mints)")
+                    await detector.notifier._send(
+                        f"🔥 **Hot Mint Detected**\n\n"
+                        f"📦 {data['name']}\n"
+                        f"⚡ {data['mint_count']} mints detected\n"
+                        f"👀 Watch for potential opportunity!"
+                    )
+                elif event_type == "whale":
+                    print(f"\n🐋 WHALE: {data['collection']} #{data['token_id']} — {data['price']:.2f} ETH")
+                    await detector.notifier._send(
+                        f"🐋 **Whale Activity**\n\n"
+                        f"📦 {data['collection']} #{data['token_id']}\n"
+                        f"💰 {data['price']:.2f} ETH\n"
+                        f"👤 {data['buyer'][:12]}..."
+                    )
+                elif event_type == "new_collection":
+                    print(f"\n🆕 NEW: {data['name']} (supply: {data['total_supply']})")
+            
+            print("🤖 Auto-detect started — monitoring trending mints & whale activity...")
+            await detector.autodetect.auto_monitor(callback=on_alert)
         
         else:
             parser.print_help()

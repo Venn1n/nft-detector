@@ -1,0 +1,24 @@
+# NFT Detector Configuration
+
+# RPC endpoints
+rpc_url: "https://eth.llamarpc.com"
+
+# API keys (optional, increases rate limits)
+etherscan_api_key: ""
+opensea_api_key: ""
+
+# Telegram notifications
+telegram:
+  bot_token: "8778923507:AAEw8nCGwzky6n3p3m3tKVV4Dja7r4Q_Fm8"
+  chat_id: "899391125"
+
+# Monitoring settings
+scan_interval: 30
+floor_interval: 60
+floor_threshold: 5.0
+
+# Watch list file
+watch_file: "watched.json"
+
+# Contracts to watch
+watch_contracts: []
