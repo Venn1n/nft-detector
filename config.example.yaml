@@ -1,0 +1,26 @@
+# NFT Detector Configuration
+
+# RPC endpoints
+rpc_url: "https://eth.llamarpc.com"
+# Alternative: "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
+
+# API keys (optional, increases rate limits)
+etherscan_api_key: ""
+opensea_api_key: ""
+
+# Telegram notifications
+telegram:
+  bot_token: ""
+  chat_id: ""
+
+# Monitoring settings
+scan_interval: 30          # seconds between scans
+floor_interval: 60         # seconds between floor checks
+floor_threshold: 5.0       # % change to trigger alert
+
+# Watch list file
+watch_file: "watched.json"
+
+# Contracts to watch (also add via CLI: nftdetector watch --contract 0x...)
+watch_contracts: []
+  # - "0x..."

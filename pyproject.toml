@@ -1,0 +1,16 @@
+[project]
+name = "nftdetector"
+version = "0.1.0"
+description = "NFT Detector — Real-time mint detection, scam analysis, and collection health monitoring"
+requires-python = ">=3.10"
+dependencies = ["pyyaml>=6.0"]
+
+[project.scripts]
+nftdetector = "nftdetector.__main__:main"
+
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[tool.setuptools.packages.find]
+include = ["nftdetector*"]
