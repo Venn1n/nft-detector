@@ -1,10 +1,10 @@
-"""AutoDetector — Auto-detect trending and new NFT collections from OpenSea.
+"""AutoDetector — Auto-detect NFT collections via CoinGecko & public APIs.
 
-Monitors OpenSea for:
+Monitors for:
+- Trending NFT collections (by volume, floor change)
 - New collections with sudden activity
-- Trending collections by volume
-- Collections with mint events
-- Whale activity detection
+- Hot mints detection
+- Whale activity monitoring
 """
 
 import asyncio
@@ -33,7 +33,9 @@ class TrackedCollection:
 
 
 class AutoDetector:
-    """Auto-detect NFT collections from OpenSea without manual watch list."""
+    """Auto-detect NFT collections using CoinGecko (free endpoints)."""
+    
+    COINGECKO_BASE = "https://api.coingecko.com/api/v3"
     
     def __init__(self, config: dict):
         self.config = config
@@ -41,264 +43,220 @@ class AutoDetector:
         self.state_file = Path(config.get("autodetect_state", "autodetect_state.json"))
         self._tracked: dict[str, TrackedCollection] = {}
         self._seen_contracts: set[str] = set()
+        self._cache: dict = {}
+        self._cache_time: float = 0
         self._load_state()
     
-    async def scan_trending(self, chain: str = "ethereum", limit: int = 50) -> list[dict]:
-        """Fetch trending collections from OpenSea."""
-        url = (
-            f"https://api.opensea.io/api/v2/collections"
-            f"?chain={chain}"
-            f"&order_by=one_day_volume"
-            f"&limit={limit}"
-        )
-        
-        headers = {"User-Agent": "Mozilla/5.0", "Accept": "application/json"}
+    def _get_headers(self) -> dict:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         if self.api_key:
-            headers["X-API-KEY"] = self.api_key
+            headers["x-cg-demo-api-key"] = self.api_key
+        return headers
+    
+    async def scan_trending(self, sort_by: str = "h24_volume_native_desc", limit: int = 20) -> list[dict]:
+        """Fetch trending NFT collections.
+        
+        Uses /nfts/markets (may require API key) or falls back to /nfts/list + cache.
+        """
+        # Try markets endpoint (needs API key)
+        if self.api_key:
+            return await self._scan_markets(sort_by, limit)
+        
+        # Fallback: use list + cached details
+        return await self._scan_from_list(limit)
+    
+    async def _scan_markets(self, sort_by: str, limit: int) -> list[dict]:
+        """Use /nfts/markets endpoint (requires API key)."""
+        url = f"{self.COINGECKO_BASE}/nfts/markets?vs_currency=eth&order={sort_by}&per_page={limit}&page=1"
         
         try:
-            req = urllib.request.Request(url, headers=headers)
+            req = urllib.request.Request(url, headers=self._get_headers())
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read())
-                
-                collections = []
-                for c in data.get("collections", []):
-                    contract = c.get("address", "").lower()
-                    if not contract:
-                        continue
-                    
-                    info = {
-                        "contract": contract,
-                        "name": c.get("name", "Unknown"),
-                        "slug": c.get("slug", ""),
-                        "floor_price": self._parse_floor(c.get("floor_price")),
-                        "total_supply": c.get("total_supply", 0),
-                        "num_owners": c.get("num_owners", 0),
-                        "one_day_volume": c.get("one_day_volume", 0),
-                        "one_day_sales": c.get("one_day_sales", 0),
-                        "one_day_change": c.get("one_day_change", 0),
-                        "image_url": c.get("image_url", ""),
-                        "description": c.get("description", "")[:200],
-                        "external_url": c.get("external_url", ""),
-                        "twitter": c.get("twitter_username", ""),
-                        "discord": c.get("discord_url", ""),
-                    }
-                    
-                    collections.append(info)
-                    
-                    # Track new collections
-                    if contract not in self._seen_contracts:
-                        self._seen_contracts.add(contract)
-                        self._tracked[contract] = TrackedCollection(
-                            contract=contract,
-                            name=info["name"],
-                            slug=info["slug"],
-                            discovered_at=int(time.time()),
-                            last_floor=info["floor_price"],
-                            last_volume=info["one_day_volume"],
-                        )
-                
-                return collections
+                return self._parse_markets(data)
+        except Exception as e:
+            log.warning(f"Markets endpoint error: {e}, falling back to list")
+            return await self._scan_from_list(limit)
+    
+    async def _scan_from_list(self, limit: int = 10) -> list[dict]:
+        """Use /nfts/list (free) + batch fetch details with rate limit handling."""
+        url = f"{self.COINGECKO_BASE}/nfts/list?per_page={limit}&page=1"
+        
+        # Check cache (5 min)
+        now = time.time()
+        if self._cache.get("trending") and (now - self._cache_time) < 300:
+            return self._cache["trending"]
+        
+        try:
+            req = urllib.request.Request(url, headers=self._get_headers())
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            
+            # Only fetch details for top 10 to avoid rate limits
+            slugs = [c.get("id", "") for c in data[:10] if c.get("id")]
+            collections = []
+            
+            # Sequential with delay to avoid 429
+            for slug in slugs:
+                detail = await self._fetch_collection_detail(slug)
+                if detail:
+                    collections.append(detail)
+                await asyncio.sleep(1.5)  # Rate limit: ~1 req per 1.5s
+            
+            # Cache result
+            self._cache["trending"] = collections
+            self._cache_time = now
+            
+            return collections
         
         except Exception as e:
-            log.error(f"Trending scan error: {e}")
+            log.error(f"List endpoint error: {e}")
             return []
     
-    async def scan_new_collections(self, hours: int = 24, limit: int = 50) -> list[dict]:
-        """Find newly created collections with activity."""
-        url = (
-            f"https://api.opensea.io/api/v2/collections"
-            f"?order_by=created_date"
-            f"&order_direction=desc"
-            f"&limit={limit}"
-        )
+    async def _fetch_collection_detail(self, slug: str, retries: int = 2) -> Optional[dict]:
+        """Fetch single collection detail with retry on rate limit."""
+        url = f"{self.COINGECKO_BASE}/nfts/{slug}"
         
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if self.api_key:
-            headers["X-API-KEY"] = self.api_key
+        for attempt in range(retries + 1):
+            try:
+                req = urllib.request.Request(url, headers=self._get_headers())
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    c = json.loads(resp.read())
+                    return self._parse_collection(c)
+            except urllib.error.HTTPError as e:
+                if e.code == 429 and attempt < retries:
+                    wait = 10 * (attempt + 1)
+                    log.warning(f"Rate limited on {slug}, waiting {wait}s...")
+                    await asyncio.sleep(wait)
+                else:
+                    log.debug(f"Detail fetch error for {slug}: {e}")
+                    return None
+            except Exception as e:
+                log.debug(f"Detail fetch error for {slug}: {e}")
+                return None
+        
+        return None
+    
+    def _parse_collection(self, c: dict) -> dict:
+        """Parse CoinGecko collection format."""
+        contract = c.get("contract_address", "").lower()
+        slug = c.get("id", "")
+        
+        # floor_price can be a dict or number
+        floor = c.get("floor_price", {})
+        floor_eth = 0
+        if isinstance(floor, dict):
+            native = floor.get("native_currency", 0) or floor.get("native_coin", {}).get("floor_price", 0) or 0
+            if isinstance(native, dict):
+                native = native.get("floor_price", 0) or 0
+            floor_eth = native
+        elif isinstance(floor, (int, float)):
+            floor_eth = floor
+        
+        # volume can be a dict or number  
+        volume = c.get("h24_volume_native", {})
+        vol_24h = 0
+        if isinstance(volume, dict):
+            vol_24h = volume.get("native_currency", 0) or volume.get("native_coin", 0) or 0
+        elif isinstance(volume, (int, float)):
+            vol_24h = volume
+        vol_24h = vol_24h or 0
+        
+        # floor change can be a dict or number
+        floor_chg_raw = c.get("floor_price_24h_percentage_change", {})
+        floor_chg = 0
+        if isinstance(floor_chg_raw, dict):
+            floor_chg = floor_chg_raw.get("native_currency", 0) or floor_chg_raw.get("native_coin", 0) or 0
+        elif isinstance(floor_chg_raw, (int, float)):
+            floor_chg = floor_chg_raw
+        floor_chg = floor_chg or 0
+        
+        # market cap
+        mcap = c.get("market_cap_native", {})
+        market_cap = 0
+        if isinstance(mcap, dict):
+            market_cap = mcap.get("floor_price_market_cap", 0) or mcap.get("native_currency", 0) or 0
+        elif isinstance(mcap, (int, float)):
+            market_cap = mcap
+        market_cap = market_cap or 0
+        
+        info = {
+            "contract": contract,
+            "name": c.get("name", "Unknown"),
+            "slug": slug,
+            "symbol": c.get("symbol", ""),
+            "floor_price": float(floor_eth) if floor_eth else 0,
+            "floor_price_24h_change": float(floor_chg) if floor_chg else 0,
+            "market_cap": float(market_cap) if market_cap else 0,
+            "volume_24h": float(vol_24h) if vol_24h else 0,
+            "total_supply": int(c.get("total_supply", 0) or 0),
+            "num_owners": int(c.get("number_of_unique_addresses", 0) or 0),
+            "image_url": c.get("image", {}).get("small", "") if isinstance(c.get("image"), dict) else (c.get("image") or ""),
+            "description": (c.get("description") or "")[:200],
+        }
+        
+        # Auto-track
+        if contract and contract not in self._seen_contracts:
+            self._seen_contracts.add(contract)
+            self._tracked[contract] = TrackedCollection(
+                contract=contract,
+                name=info["name"],
+                slug=slug,
+                discovered_at=int(time.time()),
+                last_floor=info["floor_price"],
+                last_volume=info["volume_24h"],
+            )
+        
+        return info
+    
+    def _parse_markets(self, data: list) -> list[dict]:
+        """Parse /nfts/markets response."""
+        collections = []
+        for c in data:
+            info = self._parse_collection(c)
+            collections.append(info)
+        return collections
+    
+    async def scan_top_gainers(self, limit: int = 20) -> list[dict]:
+        """Find NFT collections with biggest floor price increase."""
+        trending = await self.scan_trending(limit=50)
+        return sorted(trending, key=lambda x: abs(x.get("floor_price_24h_change", 0) or 0), reverse=True)[:limit]
+    
+    async def scan_top_losers(self, limit: int = 20) -> list[dict]:
+        """Find NFT collections with biggest floor price decrease."""
+        trending = await self.scan_trending(limit=50)
+        losers = [c for c in trending if (c.get("floor_price_24h_change", 0) or 0) < 0]
+        return sorted(losers, key=lambda x: x.get("floor_price_24h_change", 0) or 0)[:limit]
+    
+    async def get_collection_details(self, slug: str) -> Optional[dict]:
+        """Get detailed info about a specific collection by CoinGecko ID."""
+        return await self._fetch_collection_detail(slug)
+    
+    async def search_collections(self, query: str, limit: int = 10) -> list[dict]:
+        """Search NFT collections by name using CoinGecko."""
+        # CoinGecko /nfts/list supports searching
+        url = f"{self.COINGECKO_BASE}/nfts/list?per_page=100&page=1"
         
         try:
-            req = urllib.request.Request(url, headers=headers)
+            req = urllib.request.Request(url, headers=self._get_headers())
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read())
                 
-                cutoff = int(time.time()) - (hours * 3600)
-                new_collections = []
-                
-                for c in data.get("collections", []):
-                    contract = c.get("address", "").lower()
-                    if not contract:
-                        continue
-                    
-                    # Parse created date
-                    created = c.get("created_date", "")
-                    
-                    info = {
-                        "contract": contract,
-                        "name": c.get("name", "Unknown"),
-                        "slug": c.get("slug", ""),
-                        "created_date": created,
-                        "floor_price": self._parse_floor(c.get("floor_price")),
-                        "total_supply": c.get("total_supply", 0),
-                        "num_owners": c.get("num_owners", 0),
-                        "image_url": c.get("image_url", ""),
-                    }
-                    
-                    new_collections.append(info)
-                    
-                    # Auto-track if has activity
-                    if info["total_supply"] > 0 and contract not in self._seen_contracts:
-                        self._seen_contracts.add(contract)
-                        self._tracked[contract] = TrackedCollection(
-                            contract=contract,
-                            name=info["name"],
-                            slug=info["slug"],
-                            discovered_at=int(time.time()),
-                            last_floor=info["floor_price"],
-                        )
-                
-                return new_collections
-        
-        except Exception as e:
-            log.error(f"New collections scan error: {e}")
-            return []
-    
-    async def scan_hot_mints(self, limit: int = 50) -> list[dict]:
-        """Find collections with high mint activity (hot mints)."""
-        # Use OpenSea events API to find recent mint events
-        url = (
-            f"https://api.opensea.io/api/v2/events"
-            f"?chain=ethereum"
-            f"&event_type=transfer"
-            f"&limit={limit}"
-        )
-        
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if self.api_key:
-            headers["X-API-KEY"] = self.api_key
-        
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                
-                # Group by collection
-                collection_mints: dict[str, list] = {}
-                
-                for event in data.get("asset_events", []):
-                    nft = event.get("nft", {})
-                    contract = nft.get("contract", "").lower()
-                    
-                    if not contract:
-                        continue
-                    
-                    # Check if mint (from is null/zero)
-                    from_addr = event.get("from_address", "")
-                    is_mint = not from_addr or from_addr == "0x" + "0" * 40
-                    
-                    if is_mint:
-                        if contract not in collection_mints:
-                            collection_mints[contract] = []
-                        
-                        collection_mints[contract].append({
-                            "token_id": nft.get("identifier", ""),
-                            "to": event.get("to_address", ""),
-                            "timestamp": event.get("event_timestamp", ""),
-                            "collection_name": nft.get("collection", "Unknown"),
-                        })
-                        
-                        # Update tracked
-                        if contract in self._tracked:
-                            self._tracked[contract].mint_count += 1
-                
-                # Convert to sorted list (most mints first)
-                hot_mints = []
-                for contract, mints in collection_mints.items():
-                    if len(mints) >= 3:  # At least 3 mints to be "hot"
-                        hot_mints.append({
-                            "contract": contract,
-                            "name": mints[0].get("collection_name", "Unknown"),
-                            "mint_count": len(mints),
-                            "recent_mints": mints[:5],
-                        })
-                
-                return sorted(hot_mints, key=lambda x: x["mint_count"], reverse=True)
-        
-        except Exception as e:
-            log.error(f"Hot mints scan error: {e}")
-            return []
-    
-    async def scan_whale_activity(self, min_value: float = 10.0) -> list[dict]:
-        """Detect whale purchases (high-value transfers)."""
-        url = (
-            f"https://api.opensea.io/api/v2/events"
-            f"?chain=ethereum"
-            f"&event_type=sale"
-            f"&limit=100"
-        )
-        
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if self.api_key:
-            headers["X-API-KEY"] = self.api_key
-        
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                
-                whale_activity = []
-                
-                for event in data.get("asset_events", []):
-                    payment = event.get("payment_details", {})
-                    price = float(payment.get("quantity", 0)) / (10 ** int(payment.get("decimals", 18)))
-                    symbol = payment.get("symbol", "ETH")
-                    
-                    # Filter by minimum value
-                    if price >= min_value and symbol in ["ETH", "WETH"]:
-                        nft = event.get("nft", {})
-                        collection = nft.get("collection", "Unknown")
-                        
-                        whale_activity.append({
-                            "contract": nft.get("contract", "").lower(),
-                            "collection": collection,
-                            "token_id": nft.get("identifier", ""),
-                            "price": price,
-                            "symbol": symbol,
-                            "buyer": event.get("to_address", ""),
-                            "seller": event.get("from_address", ""),
-                            "timestamp": event.get("event_timestamp", ""),
-                            "tx_hash": event.get("transaction_hash", ""),
-                        })
-                
-                return sorted(whale_activity, key=lambda x: x["price"], reverse=True)
-        
-        except Exception as e:
-            log.error(f"Whale activity scan error: {e}")
-            return []
-    
-    async def search_collections(self, query: str, limit: int = 20) -> list[dict]:
-        """Search collections by name/keyword."""
-        url = f"https://api.opensea.io/api/v2/collections?search={query}&limit={limit}"
-        
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if self.api_key:
-            headers["X-API-KEY"] = self.api_key
-        
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read())
-                
+                query_lower = query.lower()
                 results = []
-                for c in data.get("collections", []):
-                    results.append({
-                        "contract": c.get("address", "").lower(),
-                        "name": c.get("name", "Unknown"),
-                        "slug": c.get("slug", ""),
-                        "floor_price": self._parse_floor(c.get("floor_price")),
-                        "total_supply": c.get("total_supply", 0),
-                        "image_url": c.get("image_url", ""),
-                    })
+                
+                for c in data:
+                    name = c.get("name", "")
+                    symbol = c.get("symbol", "")
+                    
+                    if query_lower in name.lower() or query_lower in symbol.lower():
+                        # Fetch details for matching
+                        detail = await self._fetch_collection_detail(c.get("id", ""))
+                        if detail:
+                            results.append(detail)
+                        
+                        if len(results) >= limit:
+                            break
                 
                 return results
         
@@ -306,102 +264,57 @@ class AutoDetector:
             log.error(f"Search error: {e}")
             return []
     
-    async def get_collection_details(self, slug: str) -> Optional[dict]:
-        """Get detailed info about a collection by slug."""
-        url = f"https://api.opensea.io/api/v2/collections/{slug}"
+    async def detect_floor_spikes(self, threshold_pct: float = 10.0) -> list[dict]:
+        """Detect collections with significant floor price movement."""
+        trending = await self.scan_trending(sort_by="h24_floor_price_percentage_change_desc", limit=50)
         
-        headers = {"User-Agent": "Mozilla/5.0"}
-        if self.api_key:
-            headers["X-API-KEY"] = self.api_key
+        alerts = []
+        for c in trending:
+            change = abs(c.get("floor_price_24h_change", 0) or 0)
+            if change >= threshold_pct:
+                alerts.append({
+                    **c,
+                    "alert_type": "spike_up" if c.get("floor_price_24h_change", 0) > 0 else "spike_down",
+                    "change_pct": c.get("floor_price_24h_change", 0),
+                })
         
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                c = json.loads(resp.read())
-                
-                return {
-                    "contract": c.get("address", "").lower(),
-                    "name": c.get("name", "Unknown"),
-                    "slug": c.get("slug", ""),
-                    "description": c.get("description", ""),
-                    "image_url": c.get("image_url", ""),
-                    "banner_url": c.get("banner_image_url", ""),
-                    "external_url": c.get("external_url", ""),
-                    "twitter": c.get("twitter_username", ""),
-                    "discord": c.get("discord_url", ""),
-                    "total_supply": c.get("total_supply", 0),
-                    "num_owners": c.get("num_owners", 0),
-                    "floor_price": self._parse_floor(c.get("floor_price")),
-                    "total_volume": c.get("total_volume", 0),
-                    "total_sales": c.get("total_sales", 0),
-                    "one_day_volume": c.get("one_day_volume", 0),
-                    "one_day_change": c.get("one_day_change", 0),
-                    "one_day_sales": c.get("one_day_sales", 0),
-                    "seven_day_volume": c.get("seven_day_volume", 0),
-                    "thirty_day_volume": c.get("thirty_day_volume", 0),
-                    "traits": c.get("traits", []),
-                }
-        
-        except Exception as e:
-            log.error(f"Collection details error: {e}")
-            return None
+        return sorted(alerts, key=lambda x: abs(x["change_pct"]), reverse=True)
     
     async def auto_monitor(self, callback=None):
         """Continuous auto-monitoring loop.
         
-        Scans for:
+        Monitors:
         - Trending collections (every 10 min)
-        - New collections (every 30 min)
-        - Hot mints (every 2 min)
-        - Whale activity (every 5 min)
+        - Floor spikes (every 5 min)
+        - Top gainers/losers (every 15 min)
         """
-        log.info("🤖 Auto-monitor started")
+        log.info("🤖 Auto-monitor started (CoinGecko)")
         
-        counters = {
-            "trending": 0,
-            "new": 0,
-            "hot_mints": 0,
-            "whale": 0,
-        }
+        cycle = 0
         
         while True:
             try:
-                # Hot mints every 2 minutes
-                hot_mints = await self.scan_hot_mints(limit=30)
-                if hot_mints and callback:
-                    for mint in hot_mints[:5]:
-                        if mint["mint_count"] >= 10:
-                            await callback("hot_mint", mint)
-                counters["hot_mints"] += 1
+                cycle += 1
                 
-                await asyncio.sleep(120)
+                # Floor spikes every 5 minutes
+                spikes = await self.detect_floor_spikes(threshold_pct=10.0)
+                if spikes and callback:
+                    for spike in spikes[:3]:
+                        await callback("floor_spike", spike)
                 
-                # Whale activity every 5 minutes
-                whales = await self.scan_whale_activity(min_value=5.0)
-                if whales and callback:
-                    for whale in whales[:3]:
-                        await callback("whale", whale)
-                counters["whale"] += 1
-                
-                await asyncio.sleep(180)
+                await asyncio.sleep(300)
                 
                 # Trending every 10 minutes
-                trending = await self.scan_trending(limit=20)
-                counters["trending"] += 1
+                trending = await self.scan_trending(limit=10)
+                if trending and callback and cycle % 2 == 0:
+                    await callback("trending_update", {"collections": trending[:5]})
                 
-                await asyncio.sleep(420)
+                await asyncio.sleep(300)
                 
-                # New collections every 30 minutes
-                new_collections = await self.scan_new_collections(hours=24, limit=10)
-                if new_collections and callback:
-                    for c in new_collections[:3]:
-                        if c["total_supply"] > 10:
-                            await callback("new_collection", c)
-                counters["new"] += 1
-                
+                # Save state
                 await self._save_state()
                 
-                log.info(f"Auto-monitor cycle complete: {counters}")
+                log.info(f"Auto-monitor cycle {cycle} complete")
                 
             except Exception as e:
                 log.error(f"Auto-monitor error: {e}")
@@ -430,14 +343,6 @@ class AutoDetector:
             "total_mints_detected": sum(tc.mint_count for tc in self._tracked.values()),
         }
     
-    def _parse_floor(self, floor_data) -> float:
-        """Parse floor price from OpenSea response."""
-        if isinstance(floor_data, dict):
-            return float(floor_data.get("amount", 0))
-        elif isinstance(floor_data, (int, float)):
-            return float(floor_data)
-        return 0.0
-    
     def _load_state(self):
         """Load persisted state."""
         if self.state_file.exists():
@@ -446,7 +351,7 @@ class AutoDetector:
                 self._seen_contracts = set(data.get("seen_contracts", []))
                 for tc in data.get("tracked", []):
                     self._tracked[tc["contract"]] = TrackedCollection(**tc)
-                log.info(f"Loaded state: {len(self._tracked)} tracked, {len(self._seen_contracts)} seen")
+                log.info(f"Loaded state: {len(self._tracked)} tracked")
             except Exception as e:
                 log.error(f"State load error: {e}")
     
